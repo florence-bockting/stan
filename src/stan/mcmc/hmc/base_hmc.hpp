@@ -5,7 +5,10 @@
 #include <stan/callbacks/writer.hpp>
 #include <stan/callbacks/structured_writer.hpp>
 #include <stan/mcmc/base_mcmc.hpp>
+#include <stan/mcmc/hmc/hamiltonians/dense_e_point.hpp>
+#include <stan/mcmc/hmc/hamiltonians/diag_e_point.hpp>
 #include <stan/mcmc/hmc/hamiltonians/ps_point.hpp>
+#include <stan/mcmc/hmc/hamiltonians/unit_e_point.hpp>
 #include <boost/random/uniform_01.hpp>
 #include <cmath>
 #include <limits>
@@ -15,6 +18,54 @@
 
 namespace stan {
 namespace mcmc {
+
+namespace internal {
+
+inline std::vector<double> inv_metric_as_vector(const ps_point& z) {
+  return {};
+}
+
+inline std::vector<double> inv_metric_as_vector(const diag_e_point& z) {
+  std::vector<double> result(z.inv_e_metric_.size());
+  if (!result.empty()) {
+    Eigen::Map<Eigen::VectorXd>(result.data(), result.size()) = z.inv_e_metric_;
+  }
+  return result;
+}
+
+inline std::vector<double> inv_metric_as_vector(const unit_e_point& z) {
+  std::vector<double> result(z.inv_e_metric_.size());
+  if (!result.empty()) {
+    Eigen::Map<Eigen::VectorXd>(result.data(), result.size()) = z.inv_e_metric_;
+  }
+  return result;
+}
+
+inline std::vector<double> inv_metric_as_vector(const dense_e_point& z) {
+  std::vector<double> result(z.inv_e_metric_.size());
+  if (!result.empty()) {
+    Eigen::Map<Eigen::MatrixXd>(result.data(), z.inv_e_metric_.rows(),
+                                z.inv_e_metric_.cols())
+        = z.inv_e_metric_;
+  }
+  return result;
+}
+
+inline std::string metric_type_as_string(const ps_point& z) { return ""; }
+
+inline std::string metric_type_as_string(const diag_e_point& z) {
+  return z.metric_type();
+}
+
+inline std::string metric_type_as_string(const unit_e_point& z) {
+  return z.metric_type();
+}
+
+inline std::string metric_type_as_string(const dense_e_point& z) {
+  return z.metric_type();
+}
+
+}  // namespace internal
 
 /**
  * Base class for Hamiltonian samplers.
@@ -191,6 +242,14 @@ class base_hmc : public base_mcmc {
   }
 
   double get_stepsize_jitter() const noexcept { return this->epsilon_jitter_; }
+
+  std::vector<double> get_inv_metric() const {
+    return internal::inv_metric_as_vector(this->z_);
+  }
+
+  std::string get_metric_type() const {
+    return internal::metric_type_as_string(this->z_);
+  }
 
   void sample_stepsize() {
     this->epsilon_ = this->nom_epsilon_;
