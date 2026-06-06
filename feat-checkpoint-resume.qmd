@@ -1,0 +1,331 @@
+---
+title: "Branch review: feat/checkpoint-resume"
+subtitle: "Sampling-phase checkpoint I/O for HMC/NUTS resume"
+author: "Stan contributors"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Overview
+
+This document reviews all work on the `feat/checkpoint-resume` branch relative to `develop`.
+
+**Important:** local and remote branches have **diverged**:
+
+| Tip | Commits ahead of `develop` | Content |
+|-----|---------------------------|---------|
+| `origin/feat/checkpoint-resume` | 1 | Sampling-phase checkpoint I/O (core feature) |
+| local `feat/checkpoint-resume` (HEAD) | 3 | Documentation housekeeping (AI policy, DOI badge) |
+
+The checkpoint implementation lives on the remote tip (`ed6f136ac`). The local tip (`0d57f4b79`) does not include that commit. Before merging or opening a PR, these lines should be reconciled (rebase or merge).
+
+### Goals
+
+Long MCMC runs on clusters and cloud infrastructure are vulnerable to preemption, node failure, and wall-clock limits. This branch adds **library-level support** for:
+
+1. **Writing** periodic checkpoints during the **sampling** phase of adaptive HMC/NUTS.
+2. **Resuming** a run from a checkpoint by restoring sampler state, RNG stream, and continuing for the remaining iterations.
+
+The design deliberately keeps file-path and CLI concerns outside the Stan library: **CmdStan** (or another interface) is expected to load checkpoint JSON, populate `checkpoint_options`, and wire the structured writer callback.
+
+---
+
+## Architecture
+
+```{mermaid}
+flowchart TD
+    subgraph interface [Interface layer - not in this branch]
+        CS[CmdStan / other interface]
+        CF[Checkpoint JSON file on disk]
+        CS -->|read_checkpoint| CF
+        CS -->|populate checkpoint_options| SO
+    end
+
+    subgraph services [Stan services layer]
+        SO[checkpoint_options]
+        RAS[run_adaptive_sampler]
+        GT[generate_transitions]
+        CIO[checkpoint_io.hpp]
+        SO --> RAS
+        RAS -->|resume path| RAS
+        RAS --> GT
+        GT -->|every N sampling iterations| CIO
+        CIO -->|write_checkpoint_to_writer| SW[structured_writer callback]
+    end
+
+    subgraph mcmc [MCMC layer]
+        BH[base_hmc]
+        RAS --> BH
+        BH -->|get_inv_metric, get_metric_type| CIO
+    end
+
+    SW -->|interface writes file| CF
+```
+
+### Checkpoint lifecycle
+
+1. **Fresh run:** warmup runs as usual; during sampling, every `checkpoint.freq` transitions triggers a callback that serializes state and writes via `checkpoint.writer`.
+2. **Resume run:** `checkpoint.resume` points to a loaded `checkpoint_state`. Adaptation is disengaged, metric/stepsize/RNG/position are restored, headers may be skipped (`skip_headers`), and only the **remaining** sampling iterations execute.
+
+---
+
+## Core feature: sampling-phase checkpoint I/O
+
+**Commit:** `ed6f136ac` — *add sampling-phase checkpoint I/O for HMC/NUTS resume*
+
+**Scope:** 11 files, +681 / −75 lines.
+
+### New file: `src/stan/services/util/checkpoint_io.hpp`
+
+**Why:** Centralize checkpoint schema, serialization, and atomic file I/O so services code stays focused on sampling logic.
+
+**What it provides:**
+
+| Type / function | Purpose |
+|----------------|---------|
+| `checkpoint_state` | Versioned record of everything needed to resume |
+| `checkpoint_options` | Runtime options: frequency, writer, resume pointer, `skip_headers` |
+| `read_checkpoint_json` / `serialize_checkpoint` | JSON round-trip (RapidJSON) |
+| `write_checkpoint` | Atomic write via `.tmp` + `rename` |
+| `read_checkpoint` / `checkpoint_exists` | File-based load and validation |
+| `write_checkpoint_to_writer` | Emit via `callbacks::structured_writer` |
+
+**Checkpoint schema (version 1):**
+
+```json
+{
+  "version": 1,
+  "chain_id": 2,
+  "phase": "sampling",
+  "iteration": 500,
+  "num_warmup": 200,
+  "num_samples": 800,
+  "thin": 1,
+  "random_seed": 1234,
+  "metric_type": "diag_e",
+  "step_size": 0.412,
+  "inv_metric": [ ... ],
+  "last_position": [ ... ],
+  "last_lp": -12.34,
+  "last_accept_stat": 0.87,
+  "rng_state": "..."
+}
+```
+
+| Field | Role |
+|-------|------|
+| `phase` | Always `"sampling"` in this branch; warmup checkpointing is not implemented |
+| `iteration` | Absolute iteration index (warmup + sampling offset) at checkpoint time |
+| `inv_metric` | Flattened inverse mass matrix (diag vector or dense matrix in row-major layout) |
+| `last_position` | Unconstrained parameters after last completed transition |
+| `last_lp`, `last_accept_stat` | Sample metadata for seamless continuation |
+| `rng_state` | Boost RNG stream serialized via `operator<<` / `operator>>` |
+
+---
+
+### Modified: `src/stan/services/util/run_adaptive_sampler.hpp`
+
+**Why:** This is the central orchestration point for adaptive HMC warmup + sampling; resume and periodic save must hook in here.
+
+**What changed:**
+
+- New parameters: `random_seed`, `checkpoint_options`.
+- **Resume path** (when `checkpoint.resume != nullptr`):
+  - Restore RNG from `rng_state` string.
+  - Restore metric via `restore_sampler_metric` (diag/dense only).
+  - `disengage_adaptation()`, restore stepsize, `sampler.seed(cont_params)`.
+  - Optionally skip CSV headers (`skip_headers`).
+  - Run `remaining = finish - state.iteration` sampling transitions only.
+  - Write timing for sampling phase only (warmup time reported as 0).
+- **Fresh path:** unchanged warmup flow; sampling phase passes `checkpoint.freq` and save callback to `generate_transitions`.
+- Internal helpers: `build_checkpoint_state`, `restore_sampler_metric`, compile-time detection of diag/dense point types.
+
+---
+
+### Modified: `src/stan/services/util/generate_transitions.hpp`
+
+**Why:** Checkpoints must be taken **after** a completed transition (position, log prob, and accept stat are final).
+
+**What changed:**
+
+- New optional parameters: `num_warmup`, `checkpoint_freq`, `save_checkpoint` callback.
+- During **non-warmup** iterations, when `(absolute_iteration - num_warmup) % checkpoint_freq == 0`, invokes the callback.
+- Checkpoints are keyed to **sampling** iteration count, not absolute iteration count.
+
+---
+
+### Modified: `src/stan/mcmc/hmc/base_hmc.hpp`
+
+**Why:** Checkpoint serialization needs read access to the inverse metric and metric type without exposing internal `z_` directly to services code.
+
+**What changed:**
+
+- `internal::inv_metric_as_vector` overloads for `ps_point`, `diag_e_point`, `unit_e_point`, `dense_e_point`.
+- `internal::metric_type_as_string` overloads.
+- Public accessors: `get_inv_metric()`, `get_metric_type()`.
+
+---
+
+### Modified: Hamiltonian point classes
+
+**Files:** `dense_e_point.hpp`, `diag_e_point.hpp`, `unit_e_point.hpp`
+
+**Why:** `metric_type()` is called on const sampler state during checkpoint building.
+
+**What changed:** `metric_type()` made `const` on all three classes.
+
+---
+
+### Modified: HMC/NUTS service entry points
+
+**Files:**
+
+- `hmc_nuts_diag_e_adapt.hpp`
+- `hmc_nuts_dense_e_adapt.hpp`
+- `hmc_nuts_unit_e_adapt.hpp`
+
+**Why:** Thread `checkpoint_options` from the public API into `run_adaptive_sampler`, including multi-chain overloads.
+
+**What changed:**
+
+| Sampler | Resume-aware initialization | Resume-aware sampler setup |
+|---------|----------------------------|---------------------------|
+| `hmc_nuts_diag_e_adapt` | Yes — skips `initialize` and metric read when resuming | Yes — skips metric/stepsize/window setup |
+| `hmc_nuts_dense_e_adapt` | Yes | Yes |
+| `hmc_nuts_unit_e_adapt` | **No** — always calls `initialize` | **No** — always configures adaptation |
+
+Multi-chain overloads accept `std::vector<checkpoint_options>` (one per chain) and forward `random_seed` into parallel `run_adaptive_sampler` calls.
+
+**Not modified:** static HMC variants (`hmc_static_*_adapt.hpp`) and non-adaptive samplers.
+
+---
+
+### New tests: `src/test/unit/services/util/checkpoint_io_test.cpp`
+
+**Why:** Verify serialization correctness, atomic file I/O, error handling, and RNG restoration.
+
+**Coverage:**
+
+| Test | Asserts |
+|------|---------|
+| `round_trip_serialization` | Full field equality after JSON serialize/parse; RNG stream restores |
+| `atomic_write_and_read` | `write_checkpoint` + `read_checkpoint` round-trip |
+| `missing_file_throws` | Error on missing path |
+| `truncated_json_throws` | Parse error handling |
+| `fixture_rng_state_restores` | Optional fixture at `src/test/interface/fixtures/checkpoint/checkpoint_at_500.json` (skips if absent) |
+
+---
+
+## Documentation changes (local branch only)
+
+These three commits are on local `feat/checkpoint-resume` but **not** on `origin/feat/checkpoint-resume`.
+
+### `2687af558` — add reference to AI policy in CONTRIBUTING.md
+
+**Why:** Stan adopted an [AI Contribution Policy](https://github.com/stan-dev/stan/wiki/AI-Contribution-Policy); contributors need a visible pointer from the contribution guide.
+
+**What:** Appends one line to `.github/CONTRIBUTING.md` requiring compliance with the policy.
+
+### `681767b5c` — fix: update broken link to Zenodo badge
+
+**Why:** The Zenodo badge URL in `README.md` was broken (badge image/link no longer resolved correctly).
+
+**What:** Replaced the badge markup (intermediate fix in this commit series).
+
+### `0d57f4b79` — use shields.io badge and concept DOI
+
+**Why:** Use a stable shields.io badge and link directly to the concept DOI rather than the Zenodo "latest DOI" redirect.
+
+**What:** README badge changed from:
+
+```markdown
+[![DOI](https://zenodo.org/badge/19868/stan-dev/stan.svg)](https://zenodo.org/badge/latestdoi/19868/stan-dev/stan)
+```
+
+to:
+
+```markdown
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.597268-blue)](https://doi.org/10.5281/zenodo.597268)
+```
+
+---
+
+## Open issues and design questions
+
+### Integration and scope
+
+1. **CmdStan wiring is out of scope here.** `checkpoint_options` assumes an interface loads JSON and sets `resume`, `writer`, and `freq`. Without CmdStan (or RStan/Python) changes, the feature is library-only and not user-facing. Who owns the CLI flags (`--checkpoint`, `--resume`)?
+
+2. **Warmup checkpointing is not supported.** `phase` is always `"sampling"`. Long warmup on expensive models remains unprotected. Is warmup resume a follow-up, or intentionally excluded (adaptation state is harder to serialize)?
+
+3. **Static HMC samplers are untouched.** Should `hmc_static_{diag,dense,unit}_e_adapt` gain the same API for consistency?
+
+### Correctness and consistency
+
+4. **`hmc_nuts_unit_e_adapt` resume path is incomplete.** Unlike diag/dense variants, it does not skip initialization or adaptation setup when `checkpoint.resume` is set. Resume for unit metric may silently re-initialize and re-adapt instead of continuing.
+
+5. **Multi-chain resume only works on the single-chain code path.** The `num_chains > 1` initialization loop always calls `util::initialize` and full sampler setup; it never checks `checkpoint[i].resume`. Multi-chain preempted jobs cannot resume correctly yet.
+
+6. **No cross-validation of run configuration on resume.** The code does not verify that `num_warmup`, `num_samples`, `thin`, `random_seed`, or `metric_type` in the checkpoint match the current invocation. Mismatches could produce silently wrong posterior output.
+
+7. **Dense metric dimension inference uses `sqrt(n)`.** `restore_sampler_metric` assumes `inv_metric` length is a perfect square. Non-square arrays fail at runtime with no dedicated error message.
+
+8. **`restore_sampler_metric` ignores `unit_e`.** If a checkpoint with `metric_type == "unit_e"` is passed to a unit sampler, metric restoration is a no-op (may be fine, but should be documented).
+
+### RNG and serialization
+
+9. **RNG state format is stream-based.** `ostringstream << rng` / `istringstream >> rng` depends on Boost.Random stream formatting. Is this stable across Boost versions, platforms, and compilers? A explicit, versioned RNG serialization format would be more portable.
+
+10. **Checkpoint fixture is missing.** `fixture_rng_state_restores` references `src/test/interface/fixtures/checkpoint/checkpoint_at_500.json`, which is not in the branch. The test always skips. Should a golden fixture be generated and committed, or should an integration test run a short sampling job and checkpoint instead?
+
+### Output and UX
+
+11. **`skip_headers` semantics.** When resuming into an existing output CSV, headers must be suppressed to avoid duplicate header rows. Who sets this flag — Stan or the interface? What happens on resume into a fresh output file if `skip_headers` is wrongly `true`?
+
+12. **Checkpoint frequency vs thinning.** Checkpoints fire on sampling iteration index modulo `freq`, independent of `thin`. If `thin > 1`, is the checkpoint iteration aligned with written draws or internal transitions? Document expected behavior for users.
+
+13. **Writer callback vs direct file write.** Two output paths exist (`write_checkpoint_to_writer` for runtime, `write_checkpoint` for tests/direct use). Which path does CmdStan use? Is the structured writer expected to append or overwrite?
+
+14. **Timing output on resume.** Resume path reports warmup time as `0.0` and only measures the resumed sampling segment. Is that the desired UX for logs and CSV metadata?
+
+### Branch hygiene
+
+15. **Local and remote have diverged.** Documentation commits and the checkpoint feature commit sit on different tips. Reconcile before PR review so reviewers see one coherent changeset.
+
+16. **No end-to-end or service-level resume test.** Unit tests cover I/O and RNG round-trip, but nothing runs `hmc_nuts_diag_e_adapt` → checkpoint → resume → compare iterates. What is the minimum integration test needed for merge confidence?
+
+---
+
+## Suggested next steps
+
+1. Merge or rebase local documentation commits with `origin/feat/checkpoint-resume`.
+2. Align `hmc_nuts_unit_e_adapt` and multi-chain init with the diag/dense resume logic.
+3. Add configuration validation on resume (at minimum: `num_warmup + num_samples`, `chain_id`, `random_seed`).
+4. Implement CmdStan CLI and file management (or document the expected interface contract in a short ADR).
+5. Add a service-level integration test and/or commit the checkpoint fixture.
+6. Document checkpoint file format and resume semantics in Stan's user-facing docs once the interface layer exists.
+
+---
+
+## File index
+
+| File | Change type | Summary |
+|------|-------------|---------|
+| `src/stan/services/util/checkpoint_io.hpp` | **New** | Schema, JSON I/O, atomic file writes |
+| `src/stan/services/util/run_adaptive_sampler.hpp` | Modified | Resume path, checkpoint callbacks |
+| `src/stan/services/util/generate_transitions.hpp` | Modified | Periodic save during sampling |
+| `src/stan/mcmc/hmc/base_hmc.hpp` | Modified | Metric accessors for checkpointing |
+| `src/stan/mcmc/hmc/hamiltonians/*_e_point.hpp` | Modified | `const` metric_type |
+| `src/stan/services/sample/hmc_nuts_{diag,dense,unit}_e_adapt.hpp` | Modified | `checkpoint_options` API |
+| `src/test/unit/services/util/checkpoint_io_test.cpp` | **New** | Unit tests for checkpoint I/O |
+| `.github/CONTRIBUTING.md` | Modified (local) | AI policy reference |
+| `README.md` | Modified (local) | DOI badge fix |
