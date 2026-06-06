@@ -9,10 +9,12 @@
 #include <stan/math/prim.hpp>
 #include <stan/mcmc/hmc/nuts/adapt_diag_e_nuts.hpp>
 #include <stan/services/error_codes.hpp>
+#include <stan/services/util/checkpoint_io.hpp>
 #include <stan/services/util/create_rng.hpp>
 #include <stan/services/util/inv_metric.hpp>
 #include <stan/services/util/initialize.hpp>
 #include <stan/services/util/run_adaptive_sampler.hpp>
+#include <sstream>
 #include <vector>
 
 namespace stan {
@@ -65,19 +67,23 @@ int hmc_nuts_diag_e_adapt(
     unsigned int window, callbacks::interrupt& interrupt,
     callbacks::logger& logger, callbacks::writer& init_writer,
     callbacks::writer& sample_writer, callbacks::writer& diagnostic_writer,
-    callbacks::structured_writer& metric_writer) {
+    callbacks::structured_writer& metric_writer,
+    const util::checkpoint_options& checkpoint = util::checkpoint_options{}) {
   stan::rng_t rng = util::create_rng(random_seed, chain);
 
   std::vector<double> cont_vector;
-
   Eigen::VectorXd inv_metric;
-  try {
-    cont_vector = util::initialize(model, init, rng, init_radius, true, logger,
-                                   init_writer);
 
-    inv_metric = util::read_diag_inv_metric(init_inv_metric,
-                                            model.num_params_r(), logger);
-    util::validate_diag_inv_metric(inv_metric, logger);
+  try {
+    if (checkpoint.resume != nullptr) {
+      cont_vector = checkpoint.resume->last_position;
+    } else {
+      cont_vector = util::initialize(model, init, rng, init_radius, true, logger,
+                                     init_writer);
+      inv_metric = util::read_diag_inv_metric(init_inv_metric,
+                                              model.num_params_r(), logger);
+      util::validate_diag_inv_metric(inv_metric, logger);
+    }
   } catch (const std::exception& e) {
     logger.error(e.what());
     return error_codes::CONFIG;
@@ -85,25 +91,27 @@ int hmc_nuts_diag_e_adapt(
 
   stan::mcmc::adapt_diag_e_nuts<Model, stan::rng_t> sampler(model, rng);
 
-  sampler.set_metric(inv_metric);
-  sampler.set_nominal_stepsize(stepsize);
   sampler.set_stepsize_jitter(stepsize_jitter);
   sampler.set_max_depth(max_depth);
 
-  sampler.get_stepsize_adaptation().set_mu(log(10 * stepsize));
-  sampler.get_stepsize_adaptation().set_delta(delta);
-  sampler.get_stepsize_adaptation().set_gamma(gamma);
-  sampler.get_stepsize_adaptation().set_kappa(kappa);
-  sampler.get_stepsize_adaptation().set_t0(t0);
-
-  sampler.set_window_params(num_warmup, init_buffer, term_buffer, window,
-                            logger);
+  if (checkpoint.resume == nullptr) {
+    sampler.set_metric(inv_metric);
+    sampler.set_nominal_stepsize(stepsize);
+    sampler.get_stepsize_adaptation().set_mu(log(10 * stepsize));
+    sampler.get_stepsize_adaptation().set_delta(delta);
+    sampler.get_stepsize_adaptation().set_gamma(gamma);
+    sampler.get_stepsize_adaptation().set_kappa(kappa);
+    sampler.get_stepsize_adaptation().set_t0(t0);
+    sampler.set_window_params(num_warmup, init_buffer, term_buffer, window,
+                              logger);
+  }
 
   try {
     util::run_adaptive_sampler(sampler, model, cont_vector, num_warmup,
                                num_samples, num_thin, refresh, save_warmup, rng,
                                interrupt, logger, sample_writer,
-                               diagnostic_writer, metric_writer);
+                               diagnostic_writer, metric_writer, chain, 1,
+                               random_seed, checkpoint);
   } catch (const std::exception& e) {
     logger.error(e.what());
     return error_codes::SOFTWARE;
@@ -340,14 +348,19 @@ int hmc_nuts_diag_e_adapt(
     std::vector<InitWriter>& init_writer,
     std::vector<SampleWriter>& sample_writer,
     std::vector<DiagnosticWriter>& diagnostic_writer,
-    std::vector<MetricWriter>& metric_writer) {
+    std::vector<MetricWriter>& metric_writer,
+    const std::vector<util::checkpoint_options>& checkpoint
+    = std::vector<util::checkpoint_options>{}) {
   if (num_chains == 1) {
+    const util::checkpoint_options chain_checkpoint
+        = checkpoint.empty() ? util::checkpoint_options{} : checkpoint[0];
     return hmc_nuts_diag_e_adapt(
         model, *init[0], *init_inv_metric[0], random_seed, init_chain_id,
         init_radius, num_warmup, num_samples, num_thin, save_warmup, refresh,
         stepsize, stepsize_jitter, max_depth, delta, gamma, kappa, t0,
         init_buffer, term_buffer, window, interrupt, logger, init_writer[0],
-        sample_writer[0], diagnostic_writer[0], metric_writer[0]);
+        sample_writer[0], diagnostic_writer[0], metric_writer[0],
+        chain_checkpoint);
   }
   using sample_t = stan::mcmc::adapt_diag_e_nuts<Model, stan::rng_t>;
   std::vector<stan::rng_t> rngs;
@@ -387,15 +400,18 @@ int hmc_nuts_diag_e_adapt(
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, num_chains, 1),
         [num_warmup, num_samples, num_thin, refresh, save_warmup, num_chains,
-         init_chain_id, &samplers, &model, &rngs, &interrupt, &logger,
-         &sample_writer, &cont_vectors, &diagnostic_writer,
+         init_chain_id, random_seed, &checkpoint, &samplers, &model, &rngs,
+         &interrupt, &logger, &sample_writer, &cont_vectors, &diagnostic_writer,
          &metric_writer](const tbb::blocked_range<size_t>& r) {
           for (size_t i = r.begin(); i != r.end(); ++i) {
+            const util::checkpoint_options chain_checkpoint
+                = checkpoint.empty() ? util::checkpoint_options{}
+                                     : checkpoint[i];
             util::run_adaptive_sampler(
                 samplers[i], model, cont_vectors[i], num_warmup, num_samples,
                 num_thin, refresh, save_warmup, rngs[i], interrupt, logger,
                 sample_writer[i], diagnostic_writer[i], metric_writer[i],
-                init_chain_id + i, num_chains);
+                init_chain_id + i, num_chains, random_seed, chain_checkpoint);
           }
         },
         tbb::simple_partitioner());
@@ -549,7 +565,9 @@ int hmc_nuts_diag_e_adapt(
     std::vector<InitWriter>& init_writer,
     std::vector<SampleWriter>& sample_writer,
     std::vector<DiagnosticWriter>& diagnostic_writer,
-    std::vector<MetricWriter>& metric_writer) {
+    std::vector<MetricWriter>& metric_writer,
+    const std::vector<util::checkpoint_options>& checkpoint
+    = std::vector<util::checkpoint_options>{}) {
   std::vector<std::unique_ptr<stan::io::array_var_context>> unit_e_metric;
   unit_e_metric.reserve(num_chains);
   for (size_t i = 0; i < num_chains; ++i) {
@@ -557,19 +575,22 @@ int hmc_nuts_diag_e_adapt(
         util::create_unit_e_diag_inv_metric(model.num_params_r())));
   }
   if (num_chains == 1) {
+    const util::checkpoint_options chain_checkpoint
+        = checkpoint.empty() ? util::checkpoint_options{} : checkpoint[0];
     return hmc_nuts_diag_e_adapt(
         model, *init[0], *unit_e_metric[0], random_seed, init_chain_id,
         init_radius, num_warmup, num_samples, num_thin, save_warmup, refresh,
         stepsize, stepsize_jitter, max_depth, delta, gamma, kappa, t0,
         init_buffer, term_buffer, window, interrupt, logger, init_writer[0],
-        sample_writer[0], diagnostic_writer[0], metric_writer[0]);
+        sample_writer[0], diagnostic_writer[0], metric_writer[0],
+        chain_checkpoint);
   }
   return hmc_nuts_diag_e_adapt(
       model, num_chains, init, unit_e_metric, random_seed, init_chain_id,
       init_radius, num_warmup, num_samples, num_thin, save_warmup, refresh,
       stepsize, stepsize_jitter, max_depth, delta, gamma, kappa, t0,
       init_buffer, term_buffer, window, interrupt, logger, init_writer,
-      sample_writer, diagnostic_writer, metric_writer);
+      sample_writer, diagnostic_writer, metric_writer, checkpoint);
 }
 
 /**

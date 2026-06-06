@@ -4,11 +4,15 @@
 #include <stan/callbacks/interrupt.hpp>
 #include <stan/mcmc/base_mcmc.hpp>
 #include <stan/services/util/mcmc_writer.hpp>
+#include <functional>
 #include <string>
 
 namespace stan {
 namespace services {
 namespace util {
+
+using checkpoint_save_callback
+    = std::function<void(int absolute_iteration, stan::mcmc::sample& sample)>;
 
 /**
  * Generates MCMC transitions.
@@ -38,6 +42,9 @@ namespace util {
  * @param[in] chain_id The id of the current chain, used in output.
  * @param[in] num_chains The number of chains used in the program. This
  *  is used in generate transitions to print out the chain number.
+ * @param[in] num_warmup number of warmup iterations (for checkpoint timing)
+ * @param[in] checkpoint_freq save a checkpoint every N sampling transitions
+ * @param[in] save_checkpoint callback invoked after a completed transition
  */
 template <class Model, class RNG>
 void generate_transitions(stan::mcmc::base_mcmc& sampler, int num_iterations,
@@ -47,7 +54,10 @@ void generate_transitions(stan::mcmc::base_mcmc& sampler, int num_iterations,
                           stan::mcmc::sample& init_s, Model& model,
                           RNG& base_rng, callbacks::interrupt& callback,
                           callbacks::logger& logger, size_t chain_id = 1,
-                          size_t num_chains = 1) {
+                          size_t num_chains = 1, int num_warmup = 0,
+                          int checkpoint_freq = 0,
+                          const checkpoint_save_callback& save_checkpoint
+                          = checkpoint_save_callback{}) {
   for (int m = 0; m < num_iterations; ++m) {
     callback();
 
@@ -72,6 +82,13 @@ void generate_transitions(stan::mcmc::base_mcmc& sampler, int num_iterations,
     if (save && ((m % num_thin) == 0)) {
       mcmc_writer.write_sample_params(base_rng, init_s, sampler, model);
       mcmc_writer.write_diagnostic_params(init_s, sampler);
+    }
+
+    if (!warmup && checkpoint_freq > 0 && save_checkpoint) {
+      const int absolute_iteration = start + m + 1;
+      if ((absolute_iteration - num_warmup) % checkpoint_freq == 0) {
+        save_checkpoint(absolute_iteration, init_s);
+      }
     }
   }
 }

@@ -9,6 +9,7 @@
 #include <stan/math/prim.hpp>
 #include <stan/mcmc/hmc/nuts/adapt_unit_e_nuts.hpp>
 #include <stan/services/error_codes.hpp>
+#include <stan/services/util/checkpoint_io.hpp>
 #include <stan/services/util/create_rng.hpp>
 #include <stan/services/util/initialize.hpp>
 #include <stan/services/util/run_adaptive_sampler.hpp>
@@ -58,7 +59,8 @@ int hmc_nuts_unit_e_adapt(
     double kappa, double t0, callbacks::interrupt& interrupt,
     callbacks::logger& logger, callbacks::writer& init_writer,
     callbacks::writer& sample_writer, callbacks::writer& diagnostic_writer,
-    callbacks::structured_writer& metric_writer) {
+    callbacks::structured_writer& metric_writer,
+    const util::checkpoint_options& checkpoint = util::checkpoint_options{}) {
   stan::rng_t rng = util::create_rng(random_seed, chain);
 
   std::vector<int> disc_vector;
@@ -87,7 +89,8 @@ int hmc_nuts_unit_e_adapt(
     util::run_adaptive_sampler(sampler, model, cont_vector, num_warmup,
                                num_samples, num_thin, refresh, save_warmup, rng,
                                interrupt, logger, sample_writer,
-                               diagnostic_writer, metric_writer);
+                               diagnostic_writer, metric_writer, chain, 1,
+                               random_seed, checkpoint);
   } catch (const std::exception& e) {
     logger.error(e.what());
     return error_codes::SOFTWARE;
@@ -196,13 +199,18 @@ int hmc_nuts_unit_e_adapt(
     std::vector<InitWriter>& init_writer,
     std::vector<SampleWriter>& sample_writer,
     std::vector<DiagnosticWriter>& diagnostic_writer,
-    std::vector<MetricWriter>& metric_writer) {
+    std::vector<MetricWriter>& metric_writer,
+    const std::vector<util::checkpoint_options>& checkpoint
+    = std::vector<util::checkpoint_options>{}) {
   if (num_chains == 1) {
+    const util::checkpoint_options chain_checkpoint
+        = checkpoint.empty() ? util::checkpoint_options{} : checkpoint[0];
     return hmc_nuts_unit_e_adapt(
         model, *init[0], random_seed, init_chain_id, init_radius, num_warmup,
         num_samples, num_thin, save_warmup, refresh, stepsize, stepsize_jitter,
         max_depth, delta, gamma, kappa, t0, interrupt, logger, init_writer[0],
-        sample_writer[0], diagnostic_writer[0], metric_writer[0]);
+        sample_writer[0], diagnostic_writer[0], metric_writer[0],
+        chain_checkpoint);
   }
   using sample_t = stan::mcmc::adapt_unit_e_nuts<Model, stan::rng_t>;
   std::vector<stan::rng_t> rngs;
@@ -236,15 +244,18 @@ int hmc_nuts_unit_e_adapt(
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, num_chains, 1),
         [num_warmup, num_samples, num_thin, refresh, save_warmup, num_chains,
-         init_chain_id, &samplers, &model, &rngs, &interrupt, &logger,
-         &sample_writer, &cont_vectors, &diagnostic_writer,
+         init_chain_id, random_seed, &checkpoint, &samplers, &model, &rngs,
+         &interrupt, &logger, &sample_writer, &cont_vectors, &diagnostic_writer,
          &metric_writer](const tbb::blocked_range<size_t>& r) {
           for (size_t i = r.begin(); i != r.end(); ++i) {
+            const util::checkpoint_options chain_checkpoint
+                = checkpoint.empty() ? util::checkpoint_options{}
+                                     : checkpoint[i];
             util::run_adaptive_sampler(
                 samplers[i], model, cont_vectors[i], num_warmup, num_samples,
                 num_thin, refresh, save_warmup, rngs[i], interrupt, logger,
                 sample_writer[i], diagnostic_writer[i], metric_writer[i],
-                init_chain_id + i, num_chains);
+                init_chain_id + i, num_chains, random_seed, chain_checkpoint);
           }
         },
         tbb::simple_partitioner());
