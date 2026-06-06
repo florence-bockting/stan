@@ -54,7 +54,7 @@ class dense_e_point : public ps_point {
     }
   }
 
-  inline std::string metric_type() { return "dense_e"; }
+  inline std::string metric_type() const { return "dense_e"; }
 };
 
 }  // namespace mcmc
